@@ -45,7 +45,7 @@ rule = <name>:name selector?:selector version?:version ('\n'|comment) -> (
     name, selector or [], version or [])
 lowercase = ('a'|'b'|'c'|'d'|'e'|'f'|'g'|'h'|'i'|'j'|'k'|'l'|'m'|'n'|'o'|'p'
             |'q'|'r'|'s'|'t'|'u'|'v'|'w'|'x'|'y'|'z')
-name = letterOrDigit:start (letterOrDigit|'.'|'+'|'-'|'/')+:rest
+name = letterOrDigit:start (letterOrDigit|'.'|'+'|'-'|'_'|'/')+:rest
 ws = ' '+
 profile = ('!'?:neg <(lowercase|digit|':'|'-')+>:name) -> (neg!='!', name)
 selector = ws '[' profile:p1 (ws profile)*:p2 ']' -> [p1] + p2
@@ -61,6 +61,23 @@ blank = ws? '\n' -> None
 class Depends(object):
     """Project dependencies."""
 
+    # Truth table for combining platform and user profiles:
+    # (platform, user) where False means that component
+    # voted definitely no, True means that that component
+    # voted definitely yes and None means that that component
+    # hasn't voted.
+    _include = {
+        (False, False): False,
+        (False, None): False,
+        (False, True): False,
+        (None, False): False,
+        (None, None): True,
+        (None, True): True,
+        (True, False): False,
+        (True, None): True,
+        (True, True): True,
+    }
+
     def __init__(self, depends_string):
         """Construct a Depends instance.
 
@@ -71,6 +88,48 @@ class Depends(object):
         parser = makeGrammar(grammar, {})(depends_string)
         self._rules = parser.rules()
 
+    def _partition(self, rule):
+        """Separate conditions into platform and user profiles.
+
+        :return Two lists, the platform and user profiles.
+        """
+        platform = []
+        user = []
+        for sense, profile in rule[1]:
+            if profile.startswith("platform:"):
+                platform.append((sense, profile))
+            else:
+                user.append((sense, profile))
+        return platform, user
+
+    def _evaluate(self, partition_rule, profiles):
+        """Evaluate rule. Does it match the profiles?
+
+        :return Result is trinary: False for definitely no, True for
+        definitely yes, None for no rules present.
+        """
+        if partition_rule == []:
+            return None
+
+        # Have we seen any positive selectors - if not, the absence of
+        # negatives means we include the rule, but if we any positive
+        # selectors we need a match.
+        positive = False
+        match_found = False
+        negative = False
+        for sense, profile in partition_rule:
+            if sense:
+                positive = True
+                if profile in profiles:
+                    match_found = True
+            else:
+                if profile in profiles:
+                    negative = True
+                    break
+        if not negative and (match_found or not positive):
+                return True
+        return False
+
     def active_rules(self, profiles):
         """Return the rules active given profiles.
 
@@ -80,22 +139,15 @@ class Depends(object):
         profiles = set(profiles)
         result = []
         for rule in self._rules:
-            # Have we seen any positive selectors - if not, the absence of
-            # negatives means we include the rule, but if we any positive
-            # selectors we need a match.
-            positive = False
-            match_found = False
-            negative = False
-            for sense, profile in rule[1]:
-                if sense:
-                    positive = True
-                    if profile in profiles:
-                        match_found = True
-                else:
-                    if profile in profiles:
-                        negative = True
-                        break
-            if not negative and (match_found or not positive):
+            # Partition rules
+            platform_profiles, user_profiles = self._partition(rule)
+            # Evaluate each partition separately
+            platform_status = self._evaluate(platform_profiles, profiles)
+            user_status = self._evaluate(user_profiles, profiles)
+            # Combine results
+            # These are trinary: False for definitely no, True for
+            # definitely yes, None for no rules present.
+            if self._include[platform_status, user_status]:
                 result.append(rule)
         return result
 
@@ -130,8 +182,15 @@ class Depends(object):
         return sorted(profiles)
 
     def platform_profiles(self):
-        distro, release, codename = subprocess.check_output(
-            ["lsb_release", "-cirs"], stderr=subprocess.STDOUT).lower().split()
+        output = subprocess.check_output(
+            ["lsb_release", "-cirs"],
+            stderr=subprocess.STDOUT).decode('utf-8')
+        lsbinfo = output.lower().split()
+        # NOTE(toabctl): distro can be more than one string (i.e. "SUSE LINUX")
+        codename = lsbinfo[len(lsbinfo) - 1:len(lsbinfo)][0]
+        release = lsbinfo[len(lsbinfo) - 2:len(lsbinfo) - 1][0]
+        # NOTE(toabctl): space is a delimiter for bindep, so remove the spaces
+        distro = "".join(lsbinfo[0:len(lsbinfo) - 2])
         atoms = set([distro])
         atoms.add("%s-%s" % (distro, codename))
         releasebits = release.split(".")
@@ -140,12 +199,15 @@ class Depends(object):
         if distro in ["debian", "ubuntu"]:
             atoms.add("dpkg")
             self.platform = Dpkg()
-        elif distro in ["centos", "fedora"]:
+        elif distro in ["centos", "fedora", "opensuse", "suselinux"]:
             atoms.add("rpm")
             self.platform = Rpm()
         elif distro in ["gentoo"]:
             atoms.add("emerge")
             self.platform = Emerge()
+        elif distro in ["arch"]:
+            atoms.add("pacman")
+            self.platform = Pacman()
         return ["platform:%s" % (atom,) for atom in sorted(atoms)]
 
 
@@ -170,7 +232,7 @@ class Dpkg(Platform):
         try:
             output = subprocess.check_output(
                 ["dpkg-query", "-W", "-f", "${Package} ${Status} ${Version}\n",
-                 pkg_name], stderr=subprocess.STDOUT)
+                 pkg_name], stderr=subprocess.STDOUT).decode('utf-8')
         except subprocess.CalledProcessError as e:
             if (e.returncode == 1 and
                 (e.output.startswith('dpkg-query: no packages found') or
@@ -198,7 +260,7 @@ class Rpm(Platform):
             output = subprocess.check_output(
                 ["rpm", "--qf",
                  "%{NAME} %|EPOCH?{%{EPOCH}:}|%{VERSION}-%{RELEASE}\n", "-q",
-                 pkg_name], stderr=subprocess.STDOUT)
+                 pkg_name], stderr=subprocess.STDOUT).decode('utf-8')
         except subprocess.CalledProcessError as e:
             if (e.returncode == 1 and
                 e.output.strip().endswith('is not installed')):
@@ -223,7 +285,7 @@ class Emerge(Platform):
         try:
             output = subprocess.check_output(
                 ['equery', 'l', '--format=\'$version\'', pkg_name],
-                stderr=subprocess.STDOUT)
+                stderr=subprocess.STDOUT).decode('utf-8')
         except subprocess.CalledProcessError as e:
             if e.returncode == 3:
                 return None
@@ -233,6 +295,27 @@ class Emerge(Platform):
         output = output.strip()
         elements = output.split(' ')
         return elements[0]
+
+
+class Pacman(Platform):
+    """pacman specific implementation.
+
+    This shells out to pacman
+    """
+
+    def get_pkg_version(self, pkg_name):
+        try:
+            output = subprocess.check_output(
+                ['pacman', '-Q', pkg_name],
+                stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as e:
+            if e.returncode == 1 and e.output.endswith('was not found'):
+                return None
+            raise
+        # output looks like
+        # version
+        elements = output.strip().split(' ')
+        return elements[1]
 
 
 def _eval_diff(operator, diff):
