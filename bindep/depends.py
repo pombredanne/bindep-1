@@ -18,11 +18,6 @@
 from parsley import makeGrammar
 import subprocess
 
-if not getattr(subprocess, 'check_output', None):
-    import bindep.support_py26
-    # shut pyflakes up.
-    bindep.support_py26
-
 
 debversion_grammar = """
 epoch = <digit+>:d ':' -> d
@@ -199,7 +194,11 @@ class Depends(object):
         if distro in ["debian", "ubuntu"]:
             atoms.add("dpkg")
             self.platform = Dpkg()
-        elif distro in ["centos", "fedora", "opensuse", "suselinux"]:
+        elif distro in ["centos", "redhatenterpriseserver", "fedora",
+                        "opensuse", "suselinux"]:
+            if distro == "redhatenterpriseserver":
+                # just short alias
+                atoms.add("rhel")
             atoms.add("rpm")
             self.platform = Rpm()
         elif distro in ["gentoo"]:
