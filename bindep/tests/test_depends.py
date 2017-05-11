@@ -62,11 +62,18 @@ class TestDepends(TestCase):
         mock_checkoutput.assert_called_once_with(["lsb_release", "-cirs"],
                                                  stderr=subprocess.STDOUT)
 
+    def test_detects_amazon_linux(self):
+        with self._mock_lsb("AmazonAMI"):
+            depends = Depends("")
+            self.assertThat(
+                depends.platform_profiles(), Contains("platform:amazonami"))
+
     def test_detects_centos(self):
         with self._mock_lsb("CentOS"):
             depends = Depends("")
-            self.assertThat(
-                depends.platform_profiles(), Contains("platform:centos"))
+            platform_profiles = depends.platform_profiles()
+            self.assertThat(platform_profiles, Contains("platform:centos"))
+            self.assertThat(platform_profiles, Contains("platform:redhat"))
 
     def test_detects_rhel(self):
         with self._mock_lsb("RedHatEnterpriseServer"):
@@ -78,24 +85,45 @@ class TestDepends(TestCase):
             self.assertThat(
                 platform_profiles,
                 Contains("platform:rhel"))
+            self.assertThat(
+                platform_profiles,
+                Contains("platform:redhat"))
 
     def test_detects_fedora(self):
         with self._mock_lsb("Fedora"):
             depends = Depends("")
-            self.assertThat(
-                depends.platform_profiles(), Contains("platform:fedora"))
+            platform_profiles = depends.platform_profiles()
+            self.assertThat(platform_profiles, Contains("platform:fedora"))
+            self.assertThat(platform_profiles, Contains("platform:redhat"))
 
-    def test_detects_opensuse(self):
-        with self._mock_lsb("openSUSE"):
+    def test_detects_opensuse_project(self):
+        with self._mock_lsb("openSUSE Project"):
             depends = Depends("")
-            self.assertThat(
-                depends.platform_profiles(), Contains("platform:opensuse"))
+            platform_profiles = depends.platform_profiles()
+            self.assertThat(platform_profiles,
+                            Contains("platform:opensuseproject"))
+            self.assertThat(platform_profiles,
+                            Contains("platform:opensuse"))
+            self.assertThat(platform_profiles,
+                            Contains("platform:suse"))
+
+    def test_detects_opensuse_tumbleweed(self):
+        with self._mock_lsb("openSUSE Tumbleweed"):
+            depends = Depends("")
+            platform_profiles = depends.platform_profiles()
+            self.assertThat(platform_profiles,
+                            Contains("platform:opensusetumbleweed"))
+            self.assertThat(platform_profiles,
+                            Contains("platform:opensuse"))
+            self.assertThat(platform_profiles,
+                            Contains("platform:suse"))
 
     def test_detects_suse_linux(self):
         with self._mock_lsb("SUSE Linux"):
             depends = Depends("")
-            self.assertThat(
-                depends.platform_profiles(), Contains("platform:suselinux"))
+            platform_profiles = depends.platform_profiles()
+            self.assertThat(platform_profiles, Contains("platform:suselinux"))
+            self.assertThat(platform_profiles, Contains("platform:suse"))
 
     def test_detects_ubuntu(self):
         with self._mock_lsb("Ubuntu"):
@@ -143,8 +171,15 @@ class TestDepends(TestCase):
                 depends.platform_profiles(), Contains("platform:rpm"))
             self.assertIsInstance(depends.platform, Rpm)
 
-    def test_opensuse_implies_rpm(self):
-        with self._mock_lsb("openSUSE"):
+    def test_opensuse_project_implies_rpm(self):
+        with self._mock_lsb("openSUSE Project"):
+            depends = Depends("")
+            self.assertThat(
+                depends.platform_profiles(), Contains("platform:rpm"))
+            self.assertIsInstance(depends.platform, Rpm)
+
+    def test_opensuse_tumbleweed_implies_rpm(self):
+        with self._mock_lsb("openSUSE Tumbleweed"):
             depends = Depends("")
             self.assertThat(
                 depends.platform_profiles(), Contains("platform:rpm"))
@@ -224,6 +259,17 @@ class TestDepends(TestCase):
                                      return_value=None)).mock
         self.assertEqual(
             [('missing', ['foo'])], depends.check_rules([("foo", [], [])]))
+        mock_depend_platform.assert_called_once_with("foo")
+
+    def test_check_rule_missing_version(self):
+        depends = Depends("")
+        depends.platform = mock.MagicMock()
+        mock_depend_platform = self.useFixture(
+            fixtures.MockPatchObject(depends.platform, 'get_pkg_version',
+                                     return_value=None)).mock
+        self.assertEqual(
+            [('missing', ['foo'])],
+            depends.check_rules([("foo", [], [(">=", "1.2.3")])]))
         mock_depend_platform.assert_called_once_with("foo")
 
     def test_check_rule_present(self):
@@ -370,7 +416,7 @@ class TestDpkg(TestCase):
 
         def _side_effect_raise(*args, **kwargs):
             raise subprocess.CalledProcessError(
-                1, [], "dpkg-query: no packages found matching foo\n")
+                1, [], b"dpkg-query: no packages found matching foo\n")
 
         mock_checkoutput.side_effect = _side_effect_raise
         self.assertEqual(None, platform.get_pkg_version("foo"))
@@ -444,7 +490,7 @@ class TestPacman(TestCase):
 
         def _side_effect_raise(*args, **kwargs):
             raise subprocess.CalledProcessError(
-                1, [], "error: package 'foo' was not found")
+                1, [], b"error: package 'foo' was not found")
 
         mock_checkoutput = self.useFixture(
             fixtures.MockPatchObject(subprocess, "check_output")).mock
@@ -460,7 +506,7 @@ class TestPacman(TestCase):
         platform = Pacman()
         mock_checkoutput = self.useFixture(
             fixtures.MockPatchObject(subprocess, "check_output")).mock
-        mock_checkoutput.return_value = 'foo 4.0.0-2'
+        mock_checkoutput.return_value = b'foo 4.0.0-2'
         self.assertEqual("4.0.0-2", platform.get_pkg_version("foo"))
         mock_checkoutput.assert_called_once_with(
             ['pacman', '-Q', 'foo'],
@@ -477,7 +523,7 @@ class TestRpm(TestCase):
 
         def _side_effect_raise(*args, **kwargs):
             raise subprocess.CalledProcessError(
-                1, [], "package foo is not installed\n")
+                1, [], b"package foo is not installed\n")
 
         mock_checkoutput = self.useFixture(
             fixtures.MockPatchObject(subprocess, 'check_output')).mock

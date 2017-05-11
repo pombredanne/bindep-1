@@ -15,8 +15,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from locale import getpreferredencoding
+import logging
+import os.path
 from parsley import makeGrammar
 import subprocess
+import sys
 
 
 debversion_grammar = """
@@ -51,6 +55,50 @@ comment = ws? '#' any* '\n' -> None
 any = ~'\n' anything
 blank = ws? '\n' -> None
 """
+
+
+def get_depends(filename=None):
+    fd = get_depends_file(filename)
+    if not fd:
+        return None
+    return Depends(fd.read())
+
+
+def get_depends_file(filename=None):
+    log = logging.getLogger(__name__)
+    if filename == "-":
+        return sys.stdin
+    elif filename:
+        try:
+            fd = open(filename, 'rt')
+        except IOError:
+            log.error('Error reading file %s.' % filename)
+            return None
+    else:
+        if (os.path.isfile('bindep.txt') and
+            os.path.isfile('other-requirements.txt')):
+            log.error(
+                'Both bindep.txt and other-requirements.txt '
+                'files exist, choose one.')
+            return None
+        if os.path.isfile('bindep.txt'):
+            try:
+                fd = open('bindep.txt', 'rt')
+            except IOError:
+                log.error('Error reading file bindep.txt.')
+                return None
+        elif os.path.isfile('other-requirements.txt'):
+            try:
+                fd = open('other-requirements.txt', 'rt')
+            except IOError:
+                log.error('Error reading file other-requirements.txt.')
+                return None
+        else:
+            log.error(
+                'Neither file bindep.txt nor file '
+                'other-requirements.txt exist.')
+            return None
+    return fd
 
 
 class Depends(object):
@@ -158,6 +206,7 @@ class Depends(object):
             installed = self.platform.get_pkg_version(rule[0])
             if not installed:
                 missing.add(rule[0])
+                continue
             for operator, constraint in rule[2]:
                 if not _eval(installed, operator, constraint):
                     incompatible.append(
@@ -179,7 +228,7 @@ class Depends(object):
     def platform_profiles(self):
         output = subprocess.check_output(
             ["lsb_release", "-cirs"],
-            stderr=subprocess.STDOUT).decode('utf-8')
+            stderr=subprocess.STDOUT).decode(getpreferredencoding(False))
         lsbinfo = output.lower().split()
         # NOTE(toabctl): distro can be more than one string (i.e. "SUSE LINUX")
         codename = lsbinfo[len(lsbinfo) - 1:len(lsbinfo)][0]
@@ -194,11 +243,21 @@ class Depends(object):
         if distro in ["debian", "ubuntu"]:
             atoms.add("dpkg")
             self.platform = Dpkg()
-        elif distro in ["centos", "redhatenterpriseserver", "fedora",
-                        "opensuse", "suselinux"]:
+        elif distro in ["amazonami", "centos", "redhatenterpriseserver",
+                        "fedora", "opensuseproject", "opensusetumbleweed",
+                        "suselinux"]:
             if distro == "redhatenterpriseserver":
                 # just short alias
                 atoms.add("rhel")
+            elif distro in ["opensuseproject", "opensusetumbleweed"]:
+                # just short alias
+                atoms.add("opensuse")
+            # Family aliases
+            if 'suse' in distro:
+                atoms.add("suse")
+            else:
+                atoms.add("redhat")
+
             atoms.add("rpm")
             self.platform = Rpm()
         elif distro in ["gentoo"]:
@@ -231,11 +290,13 @@ class Dpkg(Platform):
         try:
             output = subprocess.check_output(
                 ["dpkg-query", "-W", "-f", "${Package} ${Status} ${Version}\n",
-                 pkg_name], stderr=subprocess.STDOUT).decode('utf-8')
+                 pkg_name],
+                stderr=subprocess.STDOUT).decode(getpreferredencoding(False))
         except subprocess.CalledProcessError as e:
+            eoutput = e.output.decode(getpreferredencoding(False))
             if (e.returncode == 1 and
-                (e.output.startswith('dpkg-query: no packages found') or
-                 e.output.startswith('No packages found matching'))):
+                (eoutput.startswith('dpkg-query: no packages found') or
+                 eoutput.startswith('No packages found matching'))):
                 return None
             raise
         # output looks like
@@ -259,10 +320,12 @@ class Rpm(Platform):
             output = subprocess.check_output(
                 ["rpm", "--qf",
                  "%{NAME} %|EPOCH?{%{EPOCH}:}|%{VERSION}-%{RELEASE}\n", "-q",
-                 pkg_name], stderr=subprocess.STDOUT).decode('utf-8')
+                 pkg_name],
+                stderr=subprocess.STDOUT).decode(getpreferredencoding(False))
         except subprocess.CalledProcessError as e:
+            eoutput = e.output.decode(getpreferredencoding(False))
             if (e.returncode == 1 and
-                e.output.strip().endswith('is not installed')):
+                eoutput.strip().endswith('is not installed')):
                 return None
             raise
         # output looks like
@@ -284,7 +347,7 @@ class Emerge(Platform):
         try:
             output = subprocess.check_output(
                 ['equery', 'l', '--format=\'$version\'', pkg_name],
-                stderr=subprocess.STDOUT).decode('utf-8')
+                stderr=subprocess.STDOUT).decode(getpreferredencoding(False))
         except subprocess.CalledProcessError as e:
             if e.returncode == 3:
                 return None
@@ -306,9 +369,10 @@ class Pacman(Platform):
         try:
             output = subprocess.check_output(
                 ['pacman', '-Q', pkg_name],
-                stderr=subprocess.STDOUT)
+                stderr=subprocess.STDOUT).decode(getpreferredencoding(False))
         except subprocess.CalledProcessError as e:
-            if e.returncode == 1 and e.output.endswith('was not found'):
+            eoutput = e.output.decode(getpreferredencoding(False))
+            if e.returncode == 1 and eoutput.endswith('was not found'):
                 return None
             raise
         # output looks like
