@@ -46,8 +46,10 @@ lowercase = ('a'|'b'|'c'|'d'|'e'|'f'|'g'|'h'|'i'|'j'|'k'|'l'|'m'|'n'|'o'|'p'
             |'q'|'r'|'s'|'t'|'u'|'v'|'w'|'x'|'y'|'z')
 name = letterOrDigit:start (letterOrDigit|'.'|'+'|'-'|'_'|'/')+:rest
 ws = ' '+
-profile = ('!'?:neg <(lowercase|digit|':'|'-')+>:name) -> (neg!='!', name)
-selector = ws '[' profile:p1 (ws profile)*:p2 ']' -> [p1] + p2
+profile = ('!'?:neg <(lowercase|digit|':'|'-'|'.')+>:name) -> (neg!='!', name)
+profiles = '(' (ws? profile)*:p ws? ')' -> p
+group = profiles | profile
+selector = ws '[' (ws? group)*:p ws? ']' -> p
 oneversion = <('<=' | '<' | '!=' | '==' | '>=' | '>')>:rel <debversion>:v -> (
     rel, v)
 version = ws oneversion:v1 (',' oneversion)*:v2 -> [v1] + v2
@@ -138,7 +140,11 @@ class Depends(object):
         """
         platform = []
         user = []
-        for sense, profile in rule[1]:
+        for group in rule[1]:
+            if isinstance(group, list):
+                user.append(group)
+                continue
+            sense, profile = group
             if profile.startswith("platform:"):
                 platform.append((sense, profile))
             else:
@@ -160,7 +166,15 @@ class Depends(object):
         positive = False
         match_found = False
         negative = False
-        for sense, profile in partition_rule:
+        for group in partition_rule:
+            if isinstance(group, list):
+                if self._match_all(group, profiles):
+                    match_found = True
+                    continue
+                else:
+                    negative = True
+                    break
+            sense, profile = group
             if sense:
                 positive = True
                 if profile in profiles:
@@ -172,6 +186,19 @@ class Depends(object):
         if not negative and (match_found or not positive):
                 return True
         return False
+
+    def _match_all(self, partition_rules, profiles):
+        """Evaluate rules. Do they all match the profiles?
+
+        :return Result True if all profiles match else False
+        """
+        def matches(sense, profile, profiles):
+            return sense if profile in profiles else not sense
+
+        for sense, profile in partition_rules:
+            if not matches(sense, profile, profiles):
+                return False
+        return True
 
     def active_rules(self, profiles):
         """Return the rules active given profiles.
@@ -193,6 +220,25 @@ class Depends(object):
             if self._include[platform_status, user_status]:
                 result.append(rule)
         return result
+
+    def list_all_packages(self, rules, output_format='newline'):
+        """Print a list of all packages that are required on this platform
+        according to the passed in rules. This is useful if we want to build
+        RPMs based on the deps listed in bindeps.txt
+
+        :param rules: A list of rules, as returned by active_rules.
+        :param output_format: The format to print the output in. Currently
+        we support newline format which will print 1 package per line, and
+        csv format which prints a csv list.
+        :return: List of all required packages regardless of whether they are
+        missing.
+        """
+        packages_list = [rule[0] for rule in rules]
+        if output_format == 'csv':
+            logging.info(','.join(packages_list))
+        elif output_format == 'newline':
+            logging.info('\n'.join(packages_list))
+        return packages_list
 
     def check_rules(self, rules):
         """Evaluate rules against the local environment.
@@ -226,9 +272,14 @@ class Depends(object):
         return sorted(profiles)
 
     def platform_profiles(self):
-        output = subprocess.check_output(
-            ["lsb_release", "-cirs"],
-            stderr=subprocess.STDOUT).decode(getpreferredencoding(False))
+        try:
+            output = subprocess.check_output(
+                ["lsb_release", "-cirs"],
+                stderr=subprocess.STDOUT).decode(getpreferredencoding(False))
+        except OSError:
+            log = logging.getLogger(__name__)
+            log.error('Unable to execute lsb_release. Is it installed?')
+            raise
         lsbinfo = output.lower().split()
         # NOTE(toabctl): distro can be more than one string (i.e. "SUSE LINUX")
         codename = lsbinfo[len(lsbinfo) - 1:len(lsbinfo)][0]
@@ -319,13 +370,14 @@ class Rpm(Platform):
         try:
             output = subprocess.check_output(
                 ["rpm", "--qf",
-                 "%{NAME} %|EPOCH?{%{EPOCH}:}|%{VERSION}-%{RELEASE}\n", "-q",
-                 pkg_name],
+                 "%{NAME} %|EPOCH?{%{EPOCH}:}|%{VERSION}-%{RELEASE}\n",
+                 "--whatprovides", "-q", pkg_name],
                 stderr=subprocess.STDOUT).decode(getpreferredencoding(False))
         except subprocess.CalledProcessError as e:
             eoutput = e.output.decode(getpreferredencoding(False))
             if (e.returncode == 1 and
-                eoutput.strip().endswith('is not installed')):
+                (eoutput.strip().endswith('is not installed') or
+                 (eoutput.strip().startswith('no package provides')))):
                 return None
             raise
         # output looks like

@@ -47,8 +47,9 @@ class TestDepends(TestCase):
         self.assertEqual([], depends.profiles())
 
     def test_platform_profiles_succeeds(self):
-        depends = Depends("")
-        self.assertIsInstance(depends.platform_profiles(), list)
+        with self._mock_lsb('Ubuntu'):
+            depends = Depends("")
+            self.assertIsInstance(depends.platform_profiles(), list)
 
     @contextlib.contextmanager
     def _mock_lsb(self, platform):
@@ -104,6 +105,8 @@ class TestDepends(TestCase):
                             Contains("platform:opensuseproject"))
             self.assertThat(platform_profiles,
                             Contains("platform:opensuse"))
+            self.assertThat(platform_profiles,
+                            Contains("platform:opensuseproject-14.04"))
             self.assertThat(platform_profiles,
                             Contains("platform:suse"))
 
@@ -206,6 +209,12 @@ class TestDepends(TestCase):
                 depends.platform_profiles(), Contains("platform:pacman"))
             self.assertIsInstance(depends.platform, Pacman)
 
+    def test_missing_lsb_release(self):
+        with mock.patch('subprocess.check_output') as mock_co:
+            mock_co.side_effect = OSError
+            depends = Depends("")
+            self.assertRaises(OSError, depends.platform_profiles)
+
     def test_finds_profiles(self):
         depends = Depends(dedent("""\
             foo
@@ -225,6 +234,34 @@ class TestDepends(TestCase):
         depends = Depends("foo [!bar baz quux]\n")
         self.assertEqual(
             [("foo", [(False, "bar"), (True, "baz"), (True, "quux")], [])],
+            depends._rules)
+
+    def test_whitespace(self):
+        depends = Depends("foo [ ( bar !baz ) quux ]\n")
+        self.assertEqual(
+            [("foo", [[(True, "bar"), (False, "baz")], (True, "quux")], [])],
+            depends._rules)
+
+    def test_group_selectors(self):
+        depends = Depends("foo [(bar !baz) quux]\n")
+        self.assertEqual(
+            [("foo", [[(True, "bar"), (False, "baz")], (True, "quux")], [])],
+            depends._rules)
+
+    def test_multiple_group_selectors(self):
+        depends = Depends("foo [(bar baz) (baz quux)]\n")
+        parsed_profiles = [
+            [(True, "bar"), (True, "baz")],
+            [(True, "baz"), (True, "quux")],
+        ]
+        self.assertEqual(
+            [("foo", parsed_profiles, [])],
+            depends._rules)
+
+    def test_single_profile_group_selectors(self):
+        depends = Depends("foo [(bar) (!baz)]\n")
+        self.assertEqual(
+            [("foo", [[(True, "bar")], [(False, "baz")]], [])],
             depends._rules)
 
     def test_versions(self):
@@ -299,6 +336,7 @@ class TestDepends(TestCase):
             bar [something]
             category/packagename # for gentoo
             baz [platform:this platform:that-those]
+            blaz [platform:rpm !platform:opensuseproject-42.2]
             quux [anotherthing !nothing] <=12
             womp # and a comment
             # a standalone comment and a blank line
@@ -339,6 +377,65 @@ class TestDepends(TestCase):
         self.expectThat(
             set(r[0] for r in depends.active_rules(['platform:rpm', 'test'])),
             Equals({"install5", "install6", "install8", "install9"}))
+
+    def test_list_all(self):
+        depends = Depends(dedent("""\
+            install1
+            install2 [test]
+            install3 [platform:rpm]
+            install4 [platform:dpkg]
+            install5 [quark]
+            install6 [platform:dpkg test]
+            install7 [quark test]
+            install8 [platform:dpkg platform:rpm]
+            install9 [platform:dpkg platform:rpm test]
+            installA [!platform:dpkg]
+            installB [!platform:dpkg test]
+            installC [!platform:dpkg !test]
+            installD [platform:dpkg !test]
+            installE [platform:dpkg !platform:rpm]
+            installF [platform:dpkg !platform:rpm test]
+            installG [!platform:dpkg !platform:rpm]
+            installH [!platform:dpkg !platform:rpm test]
+            installI [!platform:dpkg !platform:rpm !test]
+            installJ [platform:dpkg !platform:rpm !test]
+            """))
+
+        rules_dpkg = depends.active_rules(['platform:dpkg'])
+        result_dpkg = set(r[0] for r in rules_dpkg)
+        self.assertEqual(result_dpkg,
+                         set(depends.list_all_packages(rules_dpkg,
+                             output_format='newline')))
+        self.assertEqual(result_dpkg,
+                         set(depends.list_all_packages(rules_dpkg,
+                             output_format='csv')))
+
+        rules_dpkg_test = depends.active_rules(['platform:dpkg', 'test'])
+        result_dpkg_test = set(r[0] for r in rules_dpkg_test)
+        self.assertEqual(result_dpkg_test, set(depends.list_all_packages(
+                                               rules_dpkg_test,
+                                               output_format='newline')))
+        self.assertEqual(result_dpkg_test, set(depends.list_all_packages(
+                                               rules_dpkg_test,
+                                               output_format='csv')))
+
+        rules_rpm = depends.active_rules(['platform:rpm'])
+        result_rpm = set(r[0] for r in rules_rpm)
+        self.assertEqual(result_rpm, set(depends.list_all_packages(rules_rpm,
+                                         output_format='newline')))
+        self.assertEqual(result_rpm, set(depends.list_all_packages(rules_rpm,
+                                         output_format='csv')))
+
+        rules_rpm_test = depends.active_rules(['platform:rpm', 'test'])
+        result_rpm_test = set(r[0] for r in rules_rpm_test)
+        self.assertEqual(result_rpm_test,
+                         set(depends.list_all_packages(
+                             rules_rpm_test,
+                             output_format='newline')))
+        self.assertEqual(result_rpm_test,
+                         set(depends.list_all_packages(
+                             rules_rpm_test,
+                             output_format='csv')))
 
     def test_platforms(self):
         depends = Depends(dedent("""\
@@ -531,8 +628,8 @@ class TestRpm(TestCase):
         self.assertEqual(None, platform.get_pkg_version("foo"))
         mock_checkoutput.assert_called_once_with(
             ["rpm", "--qf",
-             "%{NAME} %|EPOCH?{%{EPOCH}:}|%{VERSION}-%{RELEASE}\n", "-q",
-             "foo"],
+             "%{NAME} %|EPOCH?{%{EPOCH}:}|%{VERSION}-%{RELEASE}\n",
+             "--whatprovides", "-q", "foo"],
             stderr=subprocess.STDOUT)
         self.assertEqual(None, platform.get_pkg_version("foo"))
 
@@ -544,8 +641,8 @@ class TestRpm(TestCase):
         self.assertEqual("4.0.0-0.el6", platform.get_pkg_version("foo"))
         mock_checkoutput.assert_called_once_with(
             ["rpm", "--qf",
-             "%{NAME} %|EPOCH?{%{EPOCH}:}|%{VERSION}-%{RELEASE}\n", "-q",
-             "foo"],
+             "%{NAME} %|EPOCH?{%{EPOCH}:}|%{VERSION}-%{RELEASE}\n",
+             "--whatprovides", "-q", "foo"],
             stderr=subprocess.STDOUT)
 
 
