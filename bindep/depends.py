@@ -19,8 +19,11 @@ from locale import getpreferredencoding
 import logging
 import os.path
 from parsley import makeGrammar
+import platform
 import subprocess
 import sys
+
+import distro
 
 
 debversion_grammar = """
@@ -44,7 +47,7 @@ rule = <name>:name selector?:selector version?:version ('\n'|comment) -> (
     name, selector or [], version or [])
 lowercase = ('a'|'b'|'c'|'d'|'e'|'f'|'g'|'h'|'i'|'j'|'k'|'l'|'m'|'n'|'o'|'p'
             |'q'|'r'|'s'|'t'|'u'|'v'|'w'|'x'|'y'|'z')
-name = letterOrDigit:start (letterOrDigit|'.'|'+'|'-'|'_'|'/')+:rest
+name = (letterOrDigit|'/'):start (letterOrDigit|'.'|'+'|'-'|'_'|'/')+:rest
 ws = ' '+
 profile = ('!'?:neg <(lowercase|digit|':'|'-'|'.')+>:name) -> (neg!='!', name)
 profiles = '(' (ws? profile)*:p ws? ')' -> p
@@ -165,15 +168,15 @@ class Depends(object):
         # selectors we need a match.
         positive = False
         match_found = False
+        group_found = False
+        group_match_found = False
         negative = False
         for group in partition_rule:
             if isinstance(group, list):
+                group_found = True
                 if self._match_all(group, profiles):
-                    match_found = True
-                    continue
-                else:
-                    negative = True
-                    break
+                    group_match_found = True
+                continue
             sense, profile = group
             if sense:
                 positive = True
@@ -183,7 +186,10 @@ class Depends(object):
                 if profile in profiles:
                     negative = True
                     break
-        if not negative and (match_found or not positive):
+        if not negative:
+            if group_match_found or match_found:
+                return True
+            if not group_found and not positive:
                 return True
         return False
 
@@ -228,10 +234,10 @@ class Depends(object):
 
         :param rules: A list of rules, as returned by active_rules.
         :param output_format: The format to print the output in. Currently
-        we support newline format which will print 1 package per line, and
-        csv format which prints a csv list.
+          we support newline format which will print 1 package per line, and
+          csv format which prints a csv list.
         :return: List of all required packages regardless of whether they are
-        missing.
+          missing.
         """
         packages_list = [rule[0] for rule in rules]
         if output_format == 'csv':
@@ -267,56 +273,128 @@ class Depends(object):
     def profiles(self):
         profiles = set()
         for rule in self._rules:
-            for _, selector in rule[1]:
-                profiles.add(selector)
+            # Partition rules, but keep only the user ones
+            _, user_profiles = self._partition(rule)
+            for profile in user_profiles:
+                # Flatten a series of AND conditionals in a user rule
+                if isinstance(profile, list):
+                    profiles.update([rule[1] for rule in profile])
+                elif isinstance(profile, tuple):
+                    profiles.add(profile[1])
         return sorted(profiles)
 
-    def platform_profiles(self):
-        try:
-            output = subprocess.check_output(
-                ["lsb_release", "-cirs"],
-                stderr=subprocess.STDOUT).decode(getpreferredencoding(False))
-        except OSError:
-            log = logging.getLogger(__name__)
-            log.error('Unable to execute lsb_release. Is it installed?')
-            raise
-        lsbinfo = output.lower().split()
-        # NOTE(toabctl): distro can be more than one string (i.e. "SUSE LINUX")
-        codename = lsbinfo[len(lsbinfo) - 1:len(lsbinfo)][0]
-        release = lsbinfo[len(lsbinfo) - 2:len(lsbinfo) - 1][0]
-        # NOTE(toabctl): space is a delimiter for bindep, so remove the spaces
-        distro = "".join(lsbinfo[0:len(lsbinfo) - 2])
-        atoms = set([distro])
-        atoms.add("%s-%s" % (distro, codename))
+    def codenamebits(self, distro_id, codename):
+        atoms = set()
+        codenamebits = codename.split()
+        for i in range(len(codenamebits)):
+            atoms.add("%s-%s" % (distro_id, "-".join(codenamebits[:i + 1])))
+        return atoms
+
+    def releasebits(self, distro_id, release):
+        atoms = set()
         releasebits = release.split(".")
         for i in range(len(releasebits)):
-            atoms.add("%s-%s" % (distro, ".".join(releasebits[:i + 1])))
-        if distro in ["debian", "ubuntu"]:
+            atoms.add("%s-%s" % (distro_id, ".".join(releasebits[:i + 1])))
+        return atoms
+
+    def platform_profiles(self):
+        if platform.system() == 'Darwin':
+            atoms = set(['darwin'])
+            # detect available macos package managers
+            if os.system('which brew >/dev/null') == 0:
+                atoms.add('brew')
+                self.platform = Brew()
+            return ["platform:%s" % (atom,) for atom in sorted(atoms)]
+        distro_id = distro.id()
+        if not distro_id:
+            log = logging.getLogger(__name__)
+            log.error('Unable to determine distro ID. '
+                      'Does /etc/os-release exist or '
+                      'is lsb_release installed?')
+            raise Exception('Distro name not found')
+        # NOTE(toabctl): distro can be more than one string (i.e. "SUSE LINUX")
+        codename = distro.codename().lower()
+        release = distro.version().lower()
+        # NOTE(toabctl): space is a delimiter for bindep, so remove the spaces
+        distro_id = "".join(distro_id.split()).lower()
+        atoms = set([distro_id])
+        atoms.update(self.codenamebits(distro_id, codename))
+        atoms.update(self.releasebits(distro_id, release))
+        if distro_id in ["debian", "ubuntu"]:
             atoms.add("dpkg")
             self.platform = Dpkg()
-        elif distro in ["amazonami", "centos", "redhatenterpriseserver",
-                        "fedora", "opensuseproject", "opensusetumbleweed",
-                        "suselinux"]:
-            if distro == "redhatenterpriseserver":
+        # RPM distros seem to be especially complicated
+        elif distro_id in ["amzn", "amazonami",
+                           "centos", "rhel",
+                           "redhatenterpriseserver",
+                           "redhatenterpriseworkstation",
+                           "fedora",
+                           "opensuseproject", "opensuse", "opensuse-leap",
+                           "opensuse-tumbleweed", "sles", "suselinux"]:
+            # Distro aliases
+            if distro_id in ["redhatenterpriseserver",
+                             "redhatenterpriseworkstation"]:
                 # just short alias
                 atoms.add("rhel")
-            elif distro in ["opensuseproject", "opensusetumbleweed"]:
+                atoms.update(self.codenamebits("rhel", codename))
+                atoms.update(self.releasebits("rhel", release))
+            elif distro_id == 'rhel' and 'server' in distro.name().lower():
+                atoms.add("redhatenterpriseserver")
+                atoms.update(self.codenamebits("redhatenterpriseserver",
+                                               codename))
+                atoms.update(self.releasebits("redhatenterpriseserver",
+                                              release))
+            elif (distro_id == 'rhel' and
+                    'workstation' in distro.name().lower()):
+                atoms.add("redhatenterpriseworkstation")
+                atoms.update(self.codenamebits("redhatenterpriseworkstation",
+                                               codename))
+                atoms.update(self.releasebits("redhatenterpriseworkstation",
+                                              release))
+            elif "amzn" in distro_id:
+                atoms.add("amazonami")
+                atoms.update(self.codenamebits("amazonami", codename))
+                atoms.update(self.releasebits("amazonami", release))
+            elif "amazonami" in distro_id:
+                atoms.add("amzn")
+                atoms.update(self.codenamebits("amzn", codename))
+                atoms.update(self.releasebits("amzn", release))
+            elif "opensuse" in distro_id:
                 # just short alias
                 atoms.add("opensuse")
+                atoms.update(self.codenamebits("opensuse", codename))
+                atoms.update(self.releasebits("opensuse", release))
+                atoms.add("opensuseproject")
+                atoms.update(self.codenamebits("opensuseproject", codename))
+                atoms.update(self.releasebits("opensuseproject", release))
+            elif "sles" in distro_id:
+                atoms.add("suselinux")
+                atoms.update(self.codenamebits("suselinux", codename))
+                atoms.update(self.releasebits("suselinux", release))
+            elif "suselinux" in distro_id:
+                atoms.add("sles")
+                atoms.update(self.codenamebits("sles", codename))
+                atoms.update(self.releasebits("sles", release))
+
             # Family aliases
-            if 'suse' in distro:
+            if 'suse' in distro_id or distro_id == 'sles':
                 atoms.add("suse")
             else:
                 atoms.add("redhat")
 
             atoms.add("rpm")
             self.platform = Rpm()
-        elif distro in ["gentoo"]:
+        elif distro_id in ["gentoo"]:
             atoms.add("emerge")
             self.platform = Emerge()
-        elif distro in ["arch"]:
+        elif distro_id in ["arch"]:
             atoms.add("pacman")
             self.platform = Pacman()
+        elif distro_id in ["alpine"]:
+            atoms.add("apk")
+            self.platform = Apk()
+        else:
+            self.platform = Unknown()
         return ["platform:%s" % (atom,) for atom in sorted(atoms)]
 
 
@@ -329,6 +407,34 @@ class Platform(object):
         :return: None if pkg_name is not installed, or a version otherwise.
         """
         raise NotImplementedError(self.get_pkg_version)
+
+
+class Unknown(Platform):
+    """Unknown platform implementation. Raises error."""
+
+    def get_pkg_version(self, pkg_name):
+        raise Exception("Uknown package manager for current platform.")
+
+
+class Brew(Platform):
+    """brew specific platform implementation."""
+
+    def get_pkg_version(self, pkg_name):
+        try:
+            output = subprocess.check_output(
+                ['brew', 'list', '--versions',
+                 pkg_name],
+                stderr=subprocess.STDOUT).decode(getpreferredencoding(False))
+        except subprocess.CalledProcessError as e:
+            if (e.returncode == 1):
+                return None
+            raise
+        # output looks like
+        # git 2.15.1_1 2.15.0
+        output = output.strip()
+        elements = output.split(' ')[1:]
+        # brew supports multiple versions, we will only return the first one
+        return elements[0]
 
 
 class Dpkg(Platform):
@@ -424,13 +530,37 @@ class Pacman(Platform):
                 stderr=subprocess.STDOUT).decode(getpreferredencoding(False))
         except subprocess.CalledProcessError as e:
             eoutput = e.output.decode(getpreferredencoding(False))
-            if e.returncode == 1 and eoutput.endswith('was not found'):
+            if e.returncode == 1 and eoutput.strip().endswith('was not found'):
                 return None
             raise
         # output looks like
         # version
         elements = output.strip().split(' ')
         return elements[1]
+
+
+class Apk(Platform):
+    """apk (Alpine Linux) specific implementation.
+
+    This shells out to apk
+    """
+
+    def get_pkg_version(self, pkg_name):
+        try:
+            output = subprocess.check_output(
+                ['apk', 'version', pkg_name],
+                stderr=subprocess.STDOUT).decode(getpreferredencoding(False))
+        except subprocess.CalledProcessError as e:
+            if e.returncode == 1:
+                return None
+            raise
+        # output looks like
+        # version
+        output = output.strip()
+        elements = output.split()
+        if len(elements) < 4:
+            return None
+        return elements[4]
 
 
 def _eval_diff(operator, diff):

@@ -16,12 +16,16 @@
 # limitations under the License.
 
 import contextlib
+import os.path
+import platform
 import subprocess
 from textwrap import dedent
 
+import distro
 import fixtures
 import mock
 import ometa.runtime
+from testtools import ExpectedException
 from testtools.matchers import Contains
 from testtools.matchers import Equals
 from testtools.matchers import MatchesSetwise
@@ -33,11 +37,28 @@ from bindep.depends import Dpkg
 from bindep.depends import Emerge
 from bindep.depends import Pacman
 from bindep.depends import Rpm
+from bindep.depends import Apk
 
 
 # NOTE(notmorgan): In python3 subprocess.check_output returns bytes not
 # string. All mock calls for subprocess.check_output have been updated to
 # ensure bytes is used over string. In python 2 this is a no-op change.
+
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__),
+                           'fixtures')
+
+
+class DistroFixture(fixtures.Fixture):
+    def __init__(self, distro_name):
+        self.distro_name = distro_name.lower()
+
+    def _setUp(self):
+        # This type of monkey patching is borrowed from the distro test
+        # suite.
+        os_release = os.path.join(FIXTURE_DIR, self.distro_name,
+                                  'etc', 'os-release')
+        mydistro = distro.LinuxDistribution(False, os_release, 'non')
+        self.useFixture(fixtures.MonkeyPatch('distro._distro', mydistro))
 
 
 class TestDepends(TestCase):
@@ -46,8 +67,13 @@ class TestDepends(TestCase):
         depends = Depends("")
         self.assertEqual([], depends.profiles())
 
+    def test_3tuple(self):
+        depends = Depends(u"erlang [(infra rabbitmq hipe)]\n")
+        self.assertEqual(sorted([u'infra', u'rabbitmq', u'hipe']),
+                         depends.profiles())
+
     def test_platform_profiles_succeeds(self):
-        with self._mock_lsb('Ubuntu'):
+        with DistroFixture('Ubuntu'):
             depends = Depends("")
             self.assertIsInstance(depends.platform_profiles(), list)
 
@@ -63,21 +89,48 @@ class TestDepends(TestCase):
         mock_checkoutput.assert_called_once_with(["lsb_release", "-cirs"],
                                                  stderr=subprocess.STDOUT)
 
+    @contextlib.contextmanager
+    def _mock_platform_darwin(self, system):
+        r_val = system
+        mock_checkoutput = self.useFixture(
+            fixtures.MockPatchObject(
+                platform,
+                'system',
+                return_value=r_val)).mock
+        yield mock_checkoutput
+        mock_checkoutput.assert_called_once_with()
+
+    def test_detects_unknown(self):
+        with DistroFixture("Unknown"):
+            depends = Depends("")
+            self.assertThat(
+                depends.platform_profiles(), Contains("platform:unknown"))
+            with ExpectedException(Exception,
+                                   "Uknown package manager for "
+                                   "current platform."):
+                depends.platform.get_pkg_version('x')
+
     def test_detects_amazon_linux(self):
-        with self._mock_lsb("AmazonAMI"):
+        with DistroFixture("AmazonAMI"):
             depends = Depends("")
             self.assertThat(
                 depends.platform_profiles(), Contains("platform:amazonami"))
 
     def test_detects_centos(self):
-        with self._mock_lsb("CentOS"):
+        with DistroFixture("CentOS"):
             depends = Depends("")
             platform_profiles = depends.platform_profiles()
             self.assertThat(platform_profiles, Contains("platform:centos"))
             self.assertThat(platform_profiles, Contains("platform:redhat"))
 
+    def test_detects_darwin(self):
+        with self._mock_platform_darwin("Darwin"):
+            depends = Depends("")
+            platform_profiles = depends.platform_profiles()
+            self.assertThat(platform_profiles, Contains("platform:darwin"))
+
     def test_detects_rhel(self):
-        with self._mock_lsb("RedHatEnterpriseServer"):
+        with DistroFixture("RHELServer"):
             depends = Depends("")
             platform_profiles = depends.platform_profiles()
             self.assertThat(
@@ -90,15 +143,31 @@ class TestDepends(TestCase):
                 platform_profiles,
                 Contains("platform:redhat"))
 
+    def test_detects_rhel_workstation(self):
+        with DistroFixture("RHELWorkstation"):
+            depends = Depends("")
+            platform_profiles = depends.platform_profiles()
+            self.assertThat(
+                platform_profiles,
+                Contains("platform:redhatenterpriseworkstation"))
+            self.assertThat(
+                platform_profiles,
+                Contains("platform:rhel"))
+            self.assertThat(
+                platform_profiles,
+                Contains("platform:redhat"))
+
     def test_detects_fedora(self):
-        with self._mock_lsb("Fedora"):
+        with DistroFixture("Fedora"):
             depends = Depends("")
             platform_profiles = depends.platform_profiles()
             self.assertThat(platform_profiles, Contains("platform:fedora"))
             self.assertThat(platform_profiles, Contains("platform:redhat"))
 
     def test_detects_opensuse_project(self):
-        with self._mock_lsb("openSUSE Project"):
+        # TODO what does an os-release for opensuse project look like?
+        # Is this different than sles, leap, and tumbleweed?
+        with DistroFixture("openSUSEleap"):
             depends = Depends("")
             platform_profiles = depends.platform_profiles()
             self.assertThat(platform_profiles,
@@ -106,114 +175,135 @@ class TestDepends(TestCase):
             self.assertThat(platform_profiles,
                             Contains("platform:opensuse"))
             self.assertThat(platform_profiles,
-                            Contains("platform:opensuseproject-14.04"))
+                            Contains("platform:opensuseproject-42.1"))
             self.assertThat(platform_profiles,
                             Contains("platform:suse"))
 
-    def test_detects_opensuse_tumbleweed(self):
-        with self._mock_lsb("openSUSE Tumbleweed"):
+    def test_detects_opensuse(self):
+        with DistroFixture("openSUSEleap"):
             depends = Depends("")
             platform_profiles = depends.platform_profiles()
             self.assertThat(platform_profiles,
-                            Contains("platform:opensusetumbleweed"))
+                            Contains("platform:opensuse"))
+            self.assertThat(platform_profiles,
+                            Contains("platform:suse"))
+
+    def test_detects_opensuse_leap15(self):
+        with DistroFixture("openSUSEleap15"):
+            depends = Depends("")
+            platform_profiles = depends.platform_profiles()
             self.assertThat(platform_profiles,
                             Contains("platform:opensuse"))
             self.assertThat(platform_profiles,
                             Contains("platform:suse"))
 
     def test_detects_suse_linux(self):
-        with self._mock_lsb("SUSE Linux"):
+        with DistroFixture("SLES"):
             depends = Depends("")
             platform_profiles = depends.platform_profiles()
             self.assertThat(platform_profiles, Contains("platform:suselinux"))
             self.assertThat(platform_profiles, Contains("platform:suse"))
 
     def test_detects_ubuntu(self):
-        with self._mock_lsb("Ubuntu"):
+        with DistroFixture("Ubuntu"):
             depends = Depends("")
             self.assertThat(
                 depends.platform_profiles(), Contains("platform:ubuntu"))
 
-    def test_detects_release(self):
-        with self._mock_lsb("Ubuntu"):
+    def test_detects_alpine(self):
+        with DistroFixture("Alpine"):
             depends = Depends("")
             self.assertThat(
-                depends.platform_profiles(), Contains("platform:ubuntu-14"))
+                depends.platform_profiles(), Contains("platform:alpine"))
+
+    def test_detects_release(self):
+        with DistroFixture("Ubuntu"):
+            depends = Depends("")
+            self.assertThat(
+                depends.platform_profiles(), Contains("platform:ubuntu-16"))
 
     def test_detects_subrelease(self):
-        with self._mock_lsb("Ubuntu"):
+        with DistroFixture("Ubuntu"):
             depends = Depends("")
             self.assertThat(
-                depends.platform_profiles(), Contains("platform:ubuntu-14.04"))
+                depends.platform_profiles(), Contains("platform:ubuntu-16.04"))
 
     def test_detects_codename(self):
-        with self._mock_lsb("Ubuntu"):
+        with DistroFixture("Ubuntu"):
             depends = Depends("")
             self.assertThat(
                 depends.platform_profiles(),
-                Contains("platform:ubuntu-trusty"))
+                Contains("platform:ubuntu-xenial"))
 
     def test_centos_implies_rpm(self):
-        with self._mock_lsb("CentOS"):
+        with DistroFixture("CentOS"):
             depends = Depends("")
             self.assertThat(
                 depends.platform_profiles(), Contains("platform:rpm"))
             self.assertIsInstance(depends.platform, Rpm)
 
     def test_rhel_implies_rpm(self):
-        with self._mock_lsb("RedHatEnterpriseServer"):
+        with DistroFixture("RHELServer"):
             depends = Depends("")
             self.assertThat(
                 depends.platform_profiles(), Contains("platform:rpm"))
             self.assertIsInstance(depends.platform, Rpm)
 
     def test_fedora_implies_rpm(self):
-        with self._mock_lsb("Fedora"):
+        with DistroFixture("Fedora"):
             depends = Depends("")
             self.assertThat(
                 depends.platform_profiles(), Contains("platform:rpm"))
             self.assertIsInstance(depends.platform, Rpm)
 
     def test_opensuse_project_implies_rpm(self):
-        with self._mock_lsb("openSUSE Project"):
+        with DistroFixture("openSUSEleap"):
             depends = Depends("")
             self.assertThat(
                 depends.platform_profiles(), Contains("platform:rpm"))
             self.assertIsInstance(depends.platform, Rpm)
 
-    def test_opensuse_tumbleweed_implies_rpm(self):
-        with self._mock_lsb("openSUSE Tumbleweed"):
+    def test_opensuse_implies_rpm(self):
+        with DistroFixture("openSUSEleap"):
+            depends = Depends("")
+            self.assertThat(
+                depends.platform_profiles(), Contains("platform:rpm"))
+            self.assertIsInstance(depends.platform, Rpm)
+
+    def test_opensuse_leap15_implies_rpm(self):
+        with DistroFixture("openSUSEleap15"):
             depends = Depends("")
             self.assertThat(
                 depends.platform_profiles(), Contains("platform:rpm"))
             self.assertIsInstance(depends.platform, Rpm)
 
     def test_suse_linux_implies_rpm(self):
-        with self._mock_lsb("SUSE LINUX"):
+        with DistroFixture("SLES"):
             depends = Depends("")
             self.assertThat(
                 depends.platform_profiles(), Contains("platform:rpm"))
             self.assertIsInstance(depends.platform, Rpm)
 
     def test_ubuntu_implies_dpkg(self):
-        with self._mock_lsb("Ubuntu"):
+        with DistroFixture("Ubuntu"):
             depends = Depends("")
             self.assertThat(
                 depends.platform_profiles(), Contains("platform:dpkg"))
             self.assertIsInstance(depends.platform, Dpkg)
 
+    def test_alpine_implies_apk(self):
+        with DistroFixture("Alpine"):
+            depends = Depends("")
+            self.assertThat(
+                depends.platform_profiles(), Contains("platform:apk"))
+            self.assertIsInstance(depends.platform, Apk)
+
     def test_arch_implies_pacman(self):
-        with self._mock_lsb("Arch"):
+        with DistroFixture("Arch"):
             depends = Depends("")
             self.assertThat(
                 depends.platform_profiles(), Contains("platform:pacman"))
             self.assertIsInstance(depends.platform, Pacman)
-
-    def test_missing_lsb_release(self):
-        with mock.patch('subprocess.check_output') as mock_co:
-            mock_co.side_effect = OSError
-            depends = Depends("")
-            self.assertRaises(OSError, depends.platform_profiles)
 
     def test_finds_profiles(self):
         depends = Depends(dedent("""\
@@ -235,6 +325,19 @@ class TestDepends(TestCase):
         self.assertEqual(
             [("foo", [(False, "bar"), (True, "baz"), (True, "quux")], [])],
             depends._rules)
+
+    def test_single_group_only(self):
+        depends = Depends("foo [(bar)]\n")
+        self.assertTrue(depends._evaluate(depends._rules[0][1], ["bar"]))
+        self.assertFalse(depends._evaluate(depends._rules[0][1], ["baz"]))
+
+    def test_multiple_groups_only(self):
+        depends = Depends("foo [(bar baz) (quux)]\n")
+        self.assertTrue(depends._evaluate(depends._rules[0][1],
+                                          ["bar", "baz"]))
+        self.assertTrue(depends._evaluate(depends._rules[0][1], ["quux"]))
+        self.assertFalse(depends._evaluate(depends._rules[0][1], ["baz"]))
+        self.assertFalse(depends._evaluate(depends._rules[0][1], ["bar"]))
 
     def test_whitespace(self):
         depends = Depends("foo [ ( bar !baz ) quux ]\n")
@@ -344,6 +447,15 @@ class TestDepends(TestCase):
             # all's ok? good then
             """))
         self.assertEqual(len(depends.active_rules(['default'])), 3)
+
+    def test_parser_accepts_full_path_to_tools(self):
+        # at least yum/dnf allow these instead of mentioning rpm names
+        depends = Depends(dedent("""\
+            /usr/bin/bash
+            """))
+        self.assertEqual(
+            [("/usr/bin/bash", [], [])],
+            depends.active_rules(["default"]))
 
     def test_parser_invalid(self):
         self.assertRaises(ometa.runtime.ParseError,
@@ -607,6 +719,36 @@ class TestPacman(TestCase):
         self.assertEqual("4.0.0-2", platform.get_pkg_version("foo"))
         mock_checkoutput.assert_called_once_with(
             ['pacman', '-Q', 'foo'],
+            stderr=subprocess.STDOUT)
+
+
+class TestApk(TestCase):
+
+    def test_unknown_package(self):
+        platform = Apk()
+
+        def _side_effect_raise(*args, **kwargs):
+            raise subprocess.CalledProcessError(
+                1, [], b"Installed: Available:")
+
+        mock_checkoutput = self.useFixture(
+            fixtures.MockPatchObject(subprocess, "check_output")).mock
+        mock_checkoutput.side_effect = _side_effect_raise
+
+        self.assertEqual(None, platform.get_pkg_version("foo"))
+        mock_checkoutput.assert_called_once_with(
+            ['apk', 'version', 'foo'],
+            stderr=subprocess.STDOUT)
+        self.assertEqual(None, platform.get_pkg_version("foo"))
+
+    def test_installed_version(self):
+        platform = Apk()
+        mock_checkoutput = self.useFixture(
+            fixtures.MockPatchObject(subprocess, "check_output")).mock
+        mock_checkoutput.return_value = b'Insd: Able: foo-4.0.0-r1 = 4.0.0-r1'
+        self.assertEqual('4.0.0-r1', platform.get_pkg_version("foo"))
+        mock_checkoutput.assert_called_once_with(
+            ['apk', 'version', 'foo'],
             stderr=subprocess.STDOUT)
 
 

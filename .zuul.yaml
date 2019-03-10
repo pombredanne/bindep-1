@@ -1,60 +1,59 @@
 - job:
-    name: bindep-fallback
+    name: bindep-base
     description: |
-      Check that bindep can install packages from
-      openstack-infra/project-config/jenkins/data/bindep-fallback.txt.
+      Check that bindep itself can install packages on various platforms.
+    abstract: true
     roles:
       - zuul: openstack-infra/zuul-jobs
-    run: playbooks/bindep-fallback/run.yaml
+    run: playbooks/bindep/run.yaml
     vars:
-      zuul_work_dir: "{{ zuul.project.src_dir }}"
-      zuul_work_virtualenv: "{{ ansible_user_dir }}/.venv"
+      zuul_work_dir: '{{ zuul.project.src_dir }}'
+      zuul_work_virtualenv: '{{ ansible_user_dir }}/.venv'
 
 - job:
-    name: bindep-fallback-centos-7
-    parent: bindep-fallback
+    name: bindep-centos-7
+    parent: bindep-base
     nodeset: centos-7
 
 - job:
-    name: bindep-fallback-fedora-26
-    parent: bindep-fallback
-    nodeset: fedora-26
+    name: bindep-fedora-latest
+    parent: bindep-base
+    nodeset: fedora-latest
 
 - job:
-    name: bindep-fallback-debian-jessie
-    parent: bindep-fallback
-    nodeset: debian-jessie
+    name: bindep-opensuse-150
+    parent: bindep-base
+    nodeset: opensuse-150
 
 - job:
-    name: bindep-fallback-opensuse-423
-    parent: bindep-fallback
+    name: bindep-opensuse-423
+    parent: bindep-base
     nodeset: opensuse-423
 
 - job:
-    name: bindep-fallback-ubuntu-trusty
-    parent: bindep-fallback
+    name: bindep-ubuntu-trusty
+    parent: bindep-base
     nodeset: ubuntu-trusty
 
 - job:
-    name: bindep-fallback-ubuntu-xenial
-    parent: bindep-fallback
+    name: bindep-ubuntu-xenial
+    parent: bindep-base
     nodeset: ubuntu-xenial
 
 - project:
-    name: openstack-infra/bindep
     check:
       jobs:
-        - bindep-fallback-centos-7
-        - bindep-fallback-debian-jessie
-        - bindep-fallback-fedora-26
-        - bindep-fallback-opensuse-423
-        - bindep-fallback-ubuntu-trusty
-        - bindep-fallback-ubuntu-xenial
+        - bindep-centos-7
+        - bindep-fedora-latest
+        - bindep-opensuse-150
+        - bindep-opensuse-423
+        - bindep-ubuntu-trusty
+        - bindep-ubuntu-xenial
     gate:
       jobs:
-        - bindep-fallback-centos-7
-        - bindep-fallback-debian-jessie
-        - bindep-fallback-fedora-26
-        - bindep-fallback-opensuse-423
-        - bindep-fallback-ubuntu-trusty
-        - bindep-fallback-ubuntu-xenial
+        - bindep-centos-7
+        - bindep-fedora-latest
+        - bindep-opensuse-150
+        - bindep-opensuse-423
+        - bindep-ubuntu-trusty
+        - bindep-ubuntu-xenial
